@@ -8,7 +8,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Process
+import android.telecom.TelecomManager
 import android.widget.Toast
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import com.sevenk.core.R
 import com.sevenk.core.ui.MainActivity
@@ -29,6 +32,17 @@ import com.sevenk.core.ui.MainActivity
 class StealthReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != "android.provider.Telephony.SECRET_CODE") return
+
+        // 🔒 2026-09-25(朋友审计)：**先验发送方，再看内容**。
+        //    `SECRET_CODE` 不是受保护广播 —— 任何 App 都能自己发一条
+        //    `Intent("android.provider.Telephony.SECRET_CODE", "android_secret_code://70707")`。
+        //    以前只看 action + 拨的号，等于「谁发的都收」：
+        //    任意 App 都能用公开的默认密令 70707 关掉隐身(而且还会顺手起 root shell 读密令)。
+        if (!senderTrusted(context)) {
+            android.util.Log.w(TAG, "密令广播来自非拨号盘发送方，已忽略")
+            return
+        }
+
         // 因为清单里只声明了 scheme,所以会收到"所有"密令。
         val dialed = intent.data?.host ?: return
 
@@ -64,6 +78,69 @@ class StealthReceiver : BroadcastReceiver() {
         }.start()
     }
 
+    /**
+     * 发送方可信吗？—— 只认「拨号盘那一路」发来的密令广播。
+     *
+     * ## 为什么需要（2026-09-25 朋友审计）
+     * `android.provider.Telephony.SECRET_CODE` **不是受保护广播**：任何 App 都能自己构造
+     * 一条带 `android_secret_code://<数字>` 的广播。本 receiver 又是 `exported="true"`，
+     * 于是在补这一手之前，**任意 App 都能触发"关隐身"这条控制流**
+     * （默认密令 70707 还是公开的），还会连带让本 App 起 root shell 去读密令。
+     *
+     * ## 判据（Android 14 / API 34 起才有发送方信息）
+     *   · 系统(1000) / 电话进程(1001) / 我们自己          → 放行
+     *   · uid < 10000（系统共享 uid 段，绝不可能是普通第三方 App） → 放行
+     *   · 其余(>=10000)：满足任一条即放行
+     *       ① 发送方就是本机**默认拨号器**（比对包名或 uid）
+     *       ② 发送方带 `FLAG_SYSTEM`（预装应用）—— 覆盖"拨号由厂商电话组件发"的 ROM，
+     *          免得识别不出拨号器反而把用户锁死在隐身里
+     *   · 其它一律拒绝（静默忽略，只留一条不含密令的日志）
+     *
+     * ## 拿不到发送方时为什么放行（fail-open）
+     * API < 34 没有 `sentFromUid`。**"识别不出拨号器"而把密令拒掉 = 用户退不出隐身 = 锁死**，
+     * 那是本项目最怕的事故（见 `StealthCodeStore.acceptedCodes` 的注释）。
+     * 所以老系统上退回旧行为，只在新系统上收紧。
+     *
+     * 注：这里挡不住「有 root / adb 的人用 `input keyevent` 模拟真人拨号」——
+     * 但那种人本来就能直接改内核里的隐身标志（`/data/adb/sevenk/stealth`），无需绕密令。
+     */
+    private fun senderTrusted(context: Context): Boolean {
+        // API < 34：拿不到发送方信息，退回旧行为（宁可不加这层，也不能把人锁死）
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true
+
+        val uid = runCatching { sentFromUidCompat() }.getOrDefault(-1)
+        if (uid < 0) return true // 未知发送方 → 同上，放行
+        if (uid == Process.SYSTEM_UID || uid == Process.PHONE_UID || uid == Process.myUid()) return true
+        if (uid < Process.FIRST_APPLICATION_UID) return true // 系统共享 uid 段
+
+        // >=10000：只信"拨号那一路"
+        //   ① 本机默认拨号器（比对包名或 uid）；或
+        //   ② 预装系统应用（FLAG_SYSTEM）—— 覆盖某些 ROM 里拨号由厂商电话组件发的机型，
+        //      免得"识别不出拨号器"反而把人锁死在隐身里。
+        //   普通用户安装的 App 一律不满足 ①② → 拒绝。
+        val sentPkg = runCatching { sentFromPackageCompat() }.getOrNull()
+        val dialer = runCatching {
+            context.getSystemService(TelecomManager::class.java)?.defaultDialerPackage
+        }.getOrNull()
+        if (sentPkg != null && dialer != null && sentPkg == dialer) return true
+        if (dialer != null && runCatching {
+                context.packageManager.getApplicationInfo(dialer, 0).uid == uid
+            }.getOrDefault(false)
+        ) return true
+        if (sentPkg != null && runCatching {
+                val ai = context.packageManager.getApplicationInfo(sentPkg, 0)
+                (ai.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+            }.getOrDefault(false)
+        ) return true
+        return false
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun sentFromUidCompat(): Int = sentFromUid
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private fun sentFromPackageCompat(): String? = sentFromPackage
+
     /** 后台线程:比对 + 关隐身,返回需要主线程展示的结果 */
     private fun prepareRestore(context: Context, dialed: String): RestorePlan {
         // 必须自己比对:不是我们设置的那个数字就静默忽略,绝不打扰。
@@ -75,9 +152,13 @@ class StealthReceiver : BroadcastReceiver() {
         //    取并集后两份里任意一个都能开锁;两边都没配时才退回默认值。
         val kernelState = runCatching { Stealth.kernelState() }.getOrDefault(-1)
         val accepted = StealthCodeStore.acceptedCodes(context)
-        android.util.Log.i(TAG, "收到密令 dialed=$dialed 可接受=$accepted 隐身状态=$kernelState")
+        // 🔒 2026-09-25(朋友审计)：**密令内容一个字都不许进日志**。
+        //    以前这里把"用户拨的号"和"我们接受的号"全打了出来，后果是：
+        //    用户手滑拨错一次 → `logcat -d -s 7kkernel-stealth` 里就躺着真密令
+        //    （adb / root / 系统 bugreport 都能看到）。现在只记数量与状态，不记数字。
+        android.util.Log.i(TAG, "收到密令(内容已隐去) 候选=${accepted.size} 隐身状态=$kernelState")
         if (dialed !in accepted) {
-            android.util.Log.w(TAG, "密令不匹配,已忽略(可接受的是 $accepted)")
+            android.util.Log.w(TAG, "密令不匹配,已忽略")
             // 防暴力猜：连错 MAX_FAILS 次就临时锁 BLOCK_MILLIS（纯内存，重启即清）。
             // 注意：比对逻辑本身（取并集、trim、大小写）一个字都没动，这里只是加计数。
             fails++

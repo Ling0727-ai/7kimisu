@@ -113,7 +113,9 @@ object StealthCodeStore {
             fi
         """.trimIndent()
         val out = ShellUtils.fastCmd(getRootShell(), script)
-        android.util.Log.i(TAG, "密令落盘核验:${out.trim()}")
+        // 🔒 2026-09-25：只记成败，不记 shell 原文 —— 万一以后脚本回显里带上密令，
+        //    也不会有第二处泄露（当前脚本只回显 7K_OK/7K_FAIL + mode/owner）。
+        android.util.Log.i(TAG, "密令落盘核验:${if (out.contains("7K_OK")) "OK" else "FAIL"}")
         out.contains("7K_OK")
     }.getOrDefault(false)
 
