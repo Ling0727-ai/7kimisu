@@ -46,6 +46,19 @@ cd userspace/ksud && cargo build --target aarch64-linux-android --release -p ksu
 bash scripts/pack-source.sh vX.Y.Z
 ```
 
+## 🤖 GitHub Actions 自动构建
+
+工作流文件为 `.github/workflows/build-and-package.yml`，会按本页构建顺序自动完成：
+
+- 编译 `aarch64-linux-android` 和 `x86_64-linux-android` 的 `ksuinit`、`ksud`
+- 编译管理器 Release APK
+- 将两个 ABI 的 `ksud` 注入 APK、16K 对齐并签名
+- 生成与构建版本对应的 GPL 源码包
+
+推送 `main` 会生成 Actions artifact；推送 `v*` 标签会额外创建 GitHub Release。也可以在 Actions 页面手动运行，填写版本名（例如 `v2.28`），并选择是否发布 Release。
+
+流水线默认使用临时 CI 签名密钥，适合测试和验证；正式发布前请在仓库 Secrets 中配置 `SIGNING_KEYSTORE_BASE64`、`SIGNING_KEYSTORE_PASSWORD`、`SIGNING_KEY_ALIAS`、`SIGNING_KEY_PASSWORD`，这样可以保持 Android 更新所需的签名一致。内核 `.ko` 仍需按目标设备 KMI 单独编译，Actions 不会用通用 runner 盲编内核模块。
+
 ## 🙏 上游与致谢
 
 本项目基于 [**KernelSU**](https://github.com/tiann/KernelSU) 二次开发。

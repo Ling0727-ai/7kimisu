@@ -1,0 +1,249 @@
+name: Build and Package
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Manager version name (for example v2.28)"
+        required: true
+        default: "v2.28"
+        type: string
+      publish_release:
+        description: "Create a GitHub Release from this run"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-ksud:
+    name: Build ksud (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+            rust_builtins: aarch64
+          - target: x86_64-linux-android
+            abi: x86_64
+            rust_builtins: x86_64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Configure Cargo for Android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          python3 scripts/setup_cargo_config.py --ndk-root "$ANDROID_NDK_HOME"
+
+      - name: Build ksuinit and embed it in ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          TARGET: ${{ matrix.target }}
+          BUILTINS_ARCH: ${{ matrix.rust_builtins }}
+        run: |
+          source .github/scripts/setup-rust-build.sh "$TARGET" 26
+          builtins="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-${BUILTINS_ARCH}-android.a"
+          test -f "$builtins"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$builtins"
+          cargo build --package ksuinit --target="$TARGET" --release
+          install -Dm755 "target/$TARGET/release/ksuinit" "userspace/ksud/bin/${{ matrix.abi }}/ksuinit"
+
+      - name: Build ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          source .github/scripts/setup-rust-build.sh "$TARGET" 26
+          cargo build --manifest-path userspace/ksud/Cargo.toml --target="$TARGET" --release
+          test -x "target/$TARGET/release/ksud"
+
+      - name: Upload ksud
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksud-${{ matrix.abi }}
+          path: target/${{ matrix.target }}/release/ksud
+          if-no-files-found: error
+
+  build-package:
+    name: Build and package APK
+    runs-on: ubuntu-latest
+    needs: build-ksud
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: |
+          sdkmanager "platforms;android-37" "build-tools;37.0.0" "cmake;3.22.1" "ndk;29.0.13113456"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Select version name
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$REF_NAME"
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            version="$INPUT_VERSION"
+          else
+            version="v2.28-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+([.][0-9]+)?([.-][A-Za-z0-9.-]+)?$ ]] || {
+            echo "Invalid version name: $version" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare signing key
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          CI_KEYSTORE: ${{ runner.temp }}/7kimisu-ci.jks
+        run: |
+          if [[ -n "$SIGNING_KEYSTORE_BASE64" ]]; then
+            echo "$SIGNING_KEYSTORE_BASE64" | base64 --decode > "$CI_KEYSTORE"
+            test -s "$CI_KEYSTORE"
+            key_alias="$SIGNING_KEY_ALIAS"
+            store_password="$SIGNING_KEYSTORE_PASSWORD"
+            key_password="$SIGNING_KEY_PASSWORD"
+          else
+            key_alias="7kimisu-ci"
+            store_password="7kimisu-ci-store"
+            key_password="7kimisu-ci-key"
+            keytool -genkeypair -v \
+              -keystore "$CI_KEYSTORE" \
+              -storetype JKS \
+              -alias "$key_alias" \
+              -keyalg RSA -keysize 2048 -validity 3650 \
+              -storepass "$store_password" -keypass "$key_password" \
+              -dname "CN=7kimisu CI"
+          fi
+          {
+            echo "KEYSTORE=$CI_KEYSTORE"
+            echo "KEY_ALIAS=$key_alias"
+            echo "STORE_PASSWORD=$store_password"
+            echo "KEY_PASSWORD=$key_password"
+          } >> "$GITHUB_ENV"
+
+      - name: Download ksud builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ksud-*
+          path: downloaded-ksud
+          merge-multiple: false
+
+      - name: Place ksud binaries for repack
+        run: |
+          mkdir -p target/aarch64-linux-android/release target/x86_64-linux-android/release
+          install -Dm755 downloaded-ksud/ksud-arm64-v8a/ksud target/aarch64-linux-android/release/ksud
+          install -Dm755 downloaded-ksud/ksud-x86_64/ksud target/x86_64-linux-android/release/ksud
+          install -Dm755 downloaded-ksud/ksud-arm64-v8a/ksud dist/ksud-arm64-v8a
+          install -Dm755 downloaded-ksud/ksud-x86_64/ksud dist/ksud-x86_64
+
+      - name: Build manager APK
+        working-directory: manager
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./gradlew :app:assembleRelease \
+            -PKSU_NAME=7kimisu \
+            -PKSU_VERSION_NAME="$VERSION" \
+            -PKEYSTORE_FILE="$KEYSTORE" \
+            -PKEYSTORE_PASSWORD="$STORE_PASSWORD" \
+            -PKEY_ALIAS="$KEY_ALIAS" \
+            -PKEY_PASSWORD="$KEY_PASSWORD"
+
+      - name: Repack APK with ksud
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 repack_apk.py repack \
+            -b release -t release \
+            -a arm64-v8a -a x86_64 \
+            --strip \
+            -K "$KEYSTORE" -A "$KEY_ALIAS" \
+            -P "$STORE_PASSWORD" -S "$KEY_PASSWORD" \
+            -n "7kimisu-$VERSION" \
+            -o dist
+
+      - name: Build matching source archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/pack-source.sh "$VERSION" "$GITHUB_WORKSPACE/dist"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7kimisu-${{ steps.version.outputs.version }}
+          path: |
+            dist/*.apk
+            dist/*-src.tar.gz
+            dist/ksud-*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    runs-on: ubuntu-latest
+    needs: build-package
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 7kimisu-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
