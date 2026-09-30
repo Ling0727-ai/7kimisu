@@ -119,10 +119,11 @@ jobs:
       - name: Install Android build tools
         run: |
           sdkmanager --channel=1 \
-            'platforms;android-37' \
+            'platforms;android-37.0' \
             'build-tools;37.0.0' \
             'cmake;3.22.1' \
             'ndk;29.0.14206865'
+          test -f "$ANDROID_HOME/platforms/android-37.0/android.jar"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
