@@ -118,7 +118,11 @@ jobs:
 
       - name: Install Android build tools
         run: |
-          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'cmake;3.22.1' 'ndk;29.0.14206865'
+          sdkmanager --channel=1 \
+            'platforms;android-37' \
+            'build-tools;37.0.0' \
+            'cmake;3.22.1' \
+            'ndk;29.0.14206865'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
