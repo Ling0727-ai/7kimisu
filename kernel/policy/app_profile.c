@@ -66,12 +66,11 @@ void setup_groups(struct root_profile *profile, struct cred *cred)
 
 void seccomp_filter_release(struct task_struct *tsk);
 
-// https://cs.android.com/android/_/android/kernel/common/+/5346453405bf12d7ed6003f45dd47b71744fe1be
-// Some 15-6.6 kernel have this backport while others don't have, e.g. Pixel 10
-// See also:
-// https://github.com/tiann/KernelSU/issues/3629
+// Android vendors commonly backport the newer seccomp_filter_release locking
+// changes to their 6.1 trees. Detect the actual function shape instead of
+// relying on the upstream version number alone.
 #define NEED_BACKPORT_COMPAT                                                                                           \
-    LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+    LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 
 #if NEED_BACKPORT_COMPAT
 static bool has_call_to_spin_lock = false;
